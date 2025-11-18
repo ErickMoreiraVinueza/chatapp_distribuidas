@@ -38,25 +38,96 @@ export const uploadFile = async (req, res) => {
     // 🔒 PASO 2: Análisis profundo de esteganografía
     secureLog("🔍", "Analizando archivo por esteganografía", { roomId, mimetype: file.mimetype });
     const stegoAnalysis = await detectSteganography(file.path);
+    // --- DEBUG LOGS (temporal) ------------------------------------------
+    try {
+      let fileSize = file.size || null;
+      try {
+        if (!fileSize) {
+          const stats = fs.statSync(file.path);
+          fileSize = stats.size;
+        }
+      } catch (e) {
+        // ignore stat error
+      }
+
+      secureLog("DEBUG_UPLOAD", "Debug upload info", {
+        roomId,
+        originalName: file.originalname,
+        declaredMime: file.mimetype,
+        detectedMime: stegoAnalysis.detectedMime || null,
+        detectedType: stegoAnalysis.detectedType,
+        filePath: file.path,
+        fileSize
+      });
+    } catch (logErr) {
+      // ignore logging errors
+    }
+    // ---------------------------------------------------------------------
     
     if (!stegoAnalysis.safe) {
-      // Eliminar archivo sospechoso
-      fs.unlinkSync(file.path);
-      secureLog("⛔", "ARCHIVO BLOQUEADO - Esteganografía detectada", {
-        roomId,
-        detectedType: stegoAnalysis.detectedType,
-        entropy: stegoAnalysis.entropy,
-        hiddenFiles: stegoAnalysis.hiddenFiles?.length || 0,
-        corrupted: stegoAnalysis.corrupted || false,
-        details: stegoAnalysis.details
-      });
-      return res.status(403).json({ 
-        message: "Archivo sospechoso bloqueado",
-        reason: stegoAnalysis.corrupted 
-          ? "El archivo está corrupto o tiene una estructura inválida"
-          : "Se detectó contenido oculto o esteganografía en el archivo",
-        details: stegoAnalysis.details
-      });
+      // Minimal security policy for multimedia and common document/archive types:
+      // Allow the upload for these types unless the file is corrupted or there are
+      // CRITICAL detections that are NOT executables (EXE). This keeps a minimal
+      // safety net while avoiding false-positives for common user files.
+      const relaxTypes = [
+        "MP4","WEBM","MKV","AVI","WAV","MP3",
+        "PDF","ZIP","DOCX","XLSX","PPTX","TXT","RAR","7Z","ODT"
+      ];
+      const detectedType = stegoAnalysis.detectedType;
+
+      if (relaxTypes.includes(detectedType) && !stegoAnalysis.corrupted) {
+        const hidden = stegoAnalysis.hiddenFiles || [];
+        const critical = hidden.filter(f => f.risk === 'CRITICAL');
+        const nonExeCritical = critical.filter(f => f.type !== 'EXE');
+
+        if (nonExeCritical.length === 0) {
+          // minimal security: allow file despite EXE signatures
+          secureLog("⚠️", "MINIMAL FILE SECURITY: permitiendo archivo a pesar de detecciones EXE", {
+            roomId,
+            detectedType: stegoAnalysis.detectedType,
+            detectedMime: stegoAnalysis.detectedMime || null,
+            criticalCount: critical.length,
+            details: stegoAnalysis.details
+          });
+          // continue processing (don't block)
+        } else {
+          // Hay detecciones críticas de tipo distinto a EXE -> bloquear
+          fs.unlinkSync(file.path);
+          secureLog("⛔", "ARCHIVO BLOQUEADO - Esteganografía detectada (critico no-EXE)", {
+            roomId,
+            detectedType: stegoAnalysis.detectedType,
+            entropy: stegoAnalysis.entropy,
+            hiddenFiles: stegoAnalysis.hiddenFiles?.length || 0,
+            corrupted: stegoAnalysis.corrupted || false,
+            details: stegoAnalysis.details
+          });
+          return res.status(403).json({ 
+            message: "Archivo sospechoso bloqueado",
+            reason: stegoAnalysis.corrupted 
+              ? "El archivo está corrupto o tiene una estructura inválida"
+              : "Se detectó contenido oculto o esteganografía en el archivo",
+            details: stegoAnalysis.details
+          });
+        }
+      } else {
+        // No es un tipo con política mínima o está corrupto -> bloquear
+        fs.unlinkSync(file.path);
+        secureLog("⛔", "ARCHIVO BLOQUEADO - Esteganografía detectada", {
+          roomId,
+          detectedType: stegoAnalysis.detectedType,
+          entropy: stegoAnalysis.entropy,
+          hiddenFiles: stegoAnalysis.hiddenFiles?.length || 0,
+          corrupted: stegoAnalysis.corrupted || false,
+          details: stegoAnalysis.details
+        });
+        return res.status(403).json({ 
+          message: "Archivo sospechoso bloqueado",
+          reason: stegoAnalysis.corrupted 
+            ? "El archivo está corrupto o tiene una estructura inválida"
+            : "Se detectó contenido oculto o esteganografía en el archivo",
+          details: stegoAnalysis.details
+        });
+      }
     }
     
     // 🔒 PASO 3: Validar que el tipo MIME coincida con el contenido real
@@ -66,23 +137,66 @@ export const uploadFile = async (req, res) => {
       'GIF': ['image/gif'],
       'BMP': ['image/bmp'],
       'WEBP': ['image/webp'],
-      'PDF': ['application/pdf']
+      'PDF': ['application/pdf'],
+      'MP4': ['video/mp4', 'video/quicktime'],
+      'WEBM': ['video/webm'],
+      'MKV': ['video/x-matroska', 'video/webm'],
+      'AVI': ['video/x-msvideo'],
+      'WAV': ['audio/wav', 'audio/x-wav'],
+      'MP3': ['audio/mpeg'],
+      'ZIP': ['application/zip'],
+      'DOCX': ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      'XLSX': ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+      'PPTX': ['application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+      'TXT': ['text/plain'],
+      'RAR': ['application/x-rar-compressed', 'application/vnd.rar'],
+      '7Z': ['application/x-7z-compressed'],
+      'ODT': ['application/vnd.oasis.opendocument.text']
     };
     
     const expectedMimes = mimeTypeMap[stegoAnalysis.detectedType] || [];
-    if (expectedMimes.length > 0 && !expectedMimes.includes(file.mimetype)) {
-      fs.unlinkSync(file.path);
-      secureLog("⚠️", "MIME type no coincide con contenido", {
-        roomId,
-        declaredMime: file.mimetype,
-        detectedType: stegoAnalysis.detectedType,
-        expectedMimes: expectedMimes.join(', ')
-      });
-      return res.status(403).json({
-        message: "Tipo de archivo no coincide",
-        reason: `El archivo dice ser ${file.mimetype} pero su contenido es ${stegoAnalysis.detectedType}`,
-        details: "Posible intento de falsificación de tipo de archivo"
-      });
+    // Allow if declared mimetype matches expected OR if detector reported a mime that matches expected
+    const declaredMime = file.mimetype;
+    const detectedMime = stegoAnalysis.detectedMime || null;
+
+    const declaredMatches = expectedMimes.length > 0 && expectedMimes.includes(declaredMime);
+    const detectedMatches = expectedMimes.length > 0 && detectedMime && expectedMimes.includes(detectedMime);
+
+    if (expectedMimes.length > 0 && !(declaredMatches || detectedMatches)) {
+      // Special-case: OOXML files (docx/pptx/xlsx) are ZIP containers.
+      // If the client declared an OOXML MIME but the detector reports ZIP,
+      // allow the upload when the original filename extension matches the declared MIME.
+      const ooxmlMimes = {
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+        'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx'
+      };
+
+      const declaredExt = file.originalname ? file.originalname.split('.').pop()?.toLowerCase() : null;
+      const declaredExtWithDot = declaredExt ? `.${declaredExt}` : null;
+
+      if (stegoAnalysis.detectedType === 'ZIP' && declaredMime in ooxmlMimes && declaredExtWithDot === ooxmlMimes[declaredMime]) {
+        secureLog("⚠️", "MIME mismatch but allowing OOXML ZIP (docx/pptx/xlsx)", {
+          roomId,
+          declaredMime,
+          detectedType: stegoAnalysis.detectedType,
+          originalName: file.originalname
+        });
+        // allow to continue processing
+      } else {
+        fs.unlinkSync(file.path);
+        secureLog("⚠️", "MIME type no coincide con contenido", {
+          roomId,
+          declaredMime,
+          detectedType: stegoAnalysis.detectedType,
+          expectedMimes: expectedMimes.join(', ')
+        });
+        return res.status(403).json({
+          message: "Tipo de archivo no coincide",
+          reason: `El archivo dice ser ${declaredMime} pero su contenido es ${stegoAnalysis.detectedType}`,
+          details: "Posible intento de falsificación de tipo de archivo"
+        });
+      }
     }
 
     secureLog("✅", "Archivo aprobado análisis de seguridad", { 

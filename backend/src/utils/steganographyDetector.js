@@ -1,5 +1,7 @@
 // steganographyDetector.js - Detecta archivos con esteganografía
 import fs from 'fs';
+import { fileTypeFromBuffer } from 'file-type';
+import { secureLog } from '../utils/logger.js';
 
 /**
  * Firmas de archivos (magic numbers) para detectar archivos ocultos
@@ -26,7 +28,10 @@ const FILE_SIGNATURES = {
   PNG: [0x89, 0x50, 0x4E, 0x47],
   GIF: [0x47, 0x49, 0x46, 0x38],
   BMP: [0x42, 0x4D],
-  WEBP: [0x52, 0x49, 0x46, 0x46], // RIFF
+  WEBP: [0x52, 0x49, 0x46, 0x46], // RIFF (subtype checked later)
+  RIFF: [0x52, 0x49, 0x46, 0x46], // generic RIFF container (AVI/WAV/WEBP)
+  MP4_FTYP: [0x66, 0x74, 0x79, 0x70], // 'ftyp' box (usually at offset 4)
+  EBML: [0x1A, 0x45, 0xDF, 0xA3], // Matroska/EBML (MKV/WebM)
 };
 
 /**
@@ -48,7 +53,7 @@ const matchesSignature = (buffer, signature, offset = 0) => {
  */
 const scanForHiddenFiles = (buffer) => {
   const detections = [];
-  const scanLength = Math.min(buffer.length, 10 * 1024 * 1024); // Escanear hasta 10MB
+  const scanLength = Math.min(buffer.length, 10 * 1024 * 1024); // Escanear hasta 10MB (ajustable)
   
   // Buscar firmas de archivos peligrosos en todo el buffer
   for (let i = 0; i < scanLength - 4; i++) {
@@ -97,6 +102,17 @@ const scanForHiddenFiles = (buffer) => {
     if (matchesSignature(buffer, FILE_SIGNATURES.PDF, i)) {
       detections.push({ type: 'PDF', offset: i, risk: 'MEDIUM' });
     }
+    // Detectar contenedores genéricos/otros (RIFF/MP4/EBML) en cualquier parte
+    if (matchesSignature(buffer, FILE_SIGNATURES.RIFF, i)) {
+      // añadir detección RIFF (podría ser AVI/WAV/WEBP). Se evaluará más tarde.
+      detections.push({ type: 'RIFF', offset: i, risk: 'MEDIUM' });
+    }
+    if (matchesSignature(buffer, FILE_SIGNATURES.MP4_FTYP, i)) {
+      detections.push({ type: 'MP4_FTYP', offset: i, risk: 'MEDIUM' });
+    }
+    if (matchesSignature(buffer, FILE_SIGNATURES.EBML, i)) {
+      detections.push({ type: 'EBML', offset: i, risk: 'MEDIUM' });
+    }
   }
   
   return detections;
@@ -110,14 +126,42 @@ const detectFileType = (buffer) => {
   if (matchesSignature(buffer, FILE_SIGNATURES.PNG)) return 'PNG';
   if (matchesSignature(buffer, FILE_SIGNATURES.GIF)) return 'GIF';
   if (matchesSignature(buffer, FILE_SIGNATURES.BMP)) return 'BMP';
-  if (matchesSignature(buffer, FILE_SIGNATURES.WEBP)) return 'WEBP';
+  // RIFF-based formats: verificar subtipo en offset 8 (e.g., 'WEBP', 'AVI ', 'WAVE')
+  if (matchesSignature(buffer, FILE_SIGNATURES.RIFF)) {
+    if (buffer.length >= 12) {
+      const subtype = String.fromCharCode(buffer[8], buffer[9], buffer[10], buffer[11]);
+      if (subtype === 'WEBP') return 'WEBP';
+      if (subtype === 'AVI ') return 'AVI';
+      if (subtype === 'WAVE') return 'WAV';
+    }
+  }
+  // MP4/MOV: buscar 'ftyp' caja normalmente en offset 4 (o dentro de los primeros 16 bytes)
+  for (let i = 0; i < Math.min(16, buffer.length); i++) {
+    if (matchesSignature(buffer, FILE_SIGNATURES.MP4_FTYP, i)) return 'MP4';
+  }
+  // EBML / Matroska (MKV/WebM)
+  if (matchesSignature(buffer, FILE_SIGNATURES.EBML)) return 'MKV';
   if (matchesSignature(buffer, FILE_SIGNATURES.PDF)) return 'PDF';
   if (matchesSignature(buffer, FILE_SIGNATURES.ZIP)) return 'ZIP';
   if (matchesSignature(buffer, FILE_SIGNATURES.RAR)) return 'RAR';
   if (matchesSignature(buffer, FILE_SIGNATURES['7Z'])) return '7Z';
   if (matchesSignature(buffer, FILE_SIGNATURES.EXE)) return 'EXE';
   if (matchesSignature(buffer, FILE_SIGNATURES.ELF)) return 'ELF';
-  
+  // Heurística para detectar archivos de texto plano (TXT)
+  // Si la mayoría de bytes en la muestra son caracteres imprimibles, considerarlo texto
+  try {
+    const sampleSize = Math.min(buffer.length, 4096);
+    let printable = 0;
+    for (let i = 0; i < sampleSize; i++) {
+      const b = buffer[i];
+      if (b === 0x09 || b === 0x0A || b === 0x0D) { printable++; continue; }
+      if (b >= 0x20 && b <= 0x7E) printable++;
+    }
+    if (sampleSize > 0 && printable / sampleSize > 0.95) return 'TXT';
+  } catch (e) {
+    // ignore
+  }
+
   return 'UNKNOWN';
 };
 
@@ -200,6 +244,10 @@ const validateFileStructure = (buffer, detectedType) => {
         return validatePNG(buffer);
       case 'GIF':
         return validateGIF(buffer);
+      case 'MP4':
+        return validateMP4(buffer);
+      case 'MKV':
+        return validateMKV(buffer);
       default:
         return { valid: true };
     }
@@ -293,13 +341,40 @@ const validateGIF = (buffer) => {
 };
 
 /**
+ * Validación básica MP4/QUICKTIME: buscar caja 'ftyp' y tamaños plausibles
+ */
+const validateMP4 = (buffer) => {
+  // Debe existir 'ftyp' dentro de los primeros 256 bytes
+  const limit = Math.min(buffer.length, 256);
+  let found = false;
+  for (let i = 0; i < limit - 4; i++) {
+    if (matchesSignature(buffer, FILE_SIGNATURES.MP4_FTYP, i)) {
+      found = true;
+      break;
+    }
+  }
+  if (!found) return { valid: false, reason: 'MP4/MOV sin caja ftyp válida' };
+  return { valid: true };
+};
+
+/**
+ * Validación básica MKV/WebM: comprobar cabecera EBML
+ */
+const validateMKV = (buffer) => {
+  if (!matchesSignature(buffer, FILE_SIGNATURES.EBML)) {
+    return { valid: false, reason: 'MKV/WebM sin cabecera EBML' };
+  }
+  return { valid: true };
+};
+
+/**
  * Función principal de detección de esteganografía
  * @param {string} filePath - Ruta del archivo a analizar
  * @returns {Object} - Resultado del análisis
  */
 export const detectSteganography = async (filePath) => {
   try {
-    const buffer = fs.readFileSync(filePath);
+    const buffer = await fs.promises.readFile(filePath);
     
     // Validar tamaño mínimo
     if (buffer.length < 12) {
@@ -309,8 +384,103 @@ export const detectSteganography = async (filePath) => {
         details: '⚠️ Archivo demasiado pequeño o vacío'
       };
     }
+    // Intentar detección robusta por contenido con file-type
+    let detectedType = 'UNKNOWN';
+    let detectedMime = null;
+    try {
+      const ft = await fileTypeFromBuffer(buffer);
+      if (ft && ft.ext) {
+        detectedMime = ft.mime || null;
+        const ext = ft.ext.toLowerCase();
+        switch (ext) {
+          case 'jpg':
+          case 'jpeg':
+            detectedType = 'JPEG'; break;
+          case 'png': detectedType = 'PNG'; break;
+          case 'gif': detectedType = 'GIF'; break;
+          case 'webp': detectedType = 'WEBP'; break;
+          case 'bmp': detectedType = 'BMP'; break;
+          case 'pdf': detectedType = 'PDF'; break;
+          case 'zip': detectedType = 'ZIP'; break;
+          case 'rar': detectedType = 'RAR'; break;
+          case '7z': detectedType = '7Z'; break;
+          case 'mp4': detectedType = 'MP4'; break;
+          case 'm4a': case 'mov': detectedType = 'MP4'; break;
+          case 'webm': detectedType = 'WEBM'; break;
+          case 'mkv': detectedType = 'MKV'; break;
+          case 'avi': detectedType = 'AVI'; break;
+          case 'wav': detectedType = 'WAV'; break;
+          case 'mp3': detectedType = 'MP3'; break;
+          default:
+            // no asignar, caerá al detector de firmas
+            break;
+        }
+      }
+    } catch (err) {
+      // Ignorar error de file-type y continuar con heurísticas propias
+    }
+
+    // Si file-type devolvió ZIP, intentar distinguir archivos OOXML (docx/pptx/xlsx)
+    // buscando rutas internas típicas dentro del ZIP (por ejemplo 'word/', 'ppt/', 'xl/').
+    if (detectedMime === 'application/zip' || detectedType === 'ZIP') {
+      try {
+        const asStr = buffer.toString('utf8');
+        if (asStr.includes('word/')) detectedType = 'DOCX';
+        else if (asStr.includes('ppt/')) detectedType = 'PPTX';
+        else if (asStr.includes('xl/')) detectedType = 'XLSX';
+        else if (asStr.includes('mimetype') && asStr.includes('application/vnd.oasis.opendocument.text')) detectedType = 'ODT';
+      } catch (e) {
+        // ignore conversion errors
+      }
+    }
+
+    // Si file-type no detectó nada, usar heurísticas por firmas
+    if (detectedType === 'UNKNOWN') {
+      detectedType = detectFileType(buffer);
+    }
     
-    const detectedType = detectFileType(buffer);
+    // Optional: Scan with ClamAV if configured (CLAMD_HOST + CLAMD_PORT)
+    // Use dynamic import and be tolerant if `clamdjs` is not installed.
+    if (process.env.CLAMD_HOST && process.env.CLAMD_PORT) {
+      try {
+        const clam = await import('clamdjs');
+        // Try common client APIs: scanBuffer or createScanner
+        let scanResult = null;
+        const host = process.env.CLAMD_HOST;
+        const port = parseInt(process.env.CLAMD_PORT, 10) || 3310;
+
+        if (typeof clam.scanBuffer === 'function') {
+          scanResult = await clam.scanBuffer(buffer, { host, port });
+        } else if (typeof clam.createScanner === 'function') {
+          const scanner = clam.createScanner({ host, port });
+          if (typeof scanner.scanBuffer === 'function') {
+            scanResult = await scanner.scanBuffer(buffer);
+          } else if (typeof scanner.scan === 'function') {
+            scanResult = await scanner.scan(buffer);
+          }
+        } else if (typeof clam.ClamScan === 'function') {
+          const scanner = new clam.ClamScan({ host, port });
+          if (typeof scanner.scanBuffer === 'function') scanResult = await scanner.scanBuffer(buffer);
+        }
+
+        // Normalize result: many clients return a string like "stream: OK" or "stream: Eicar-Test-Signature FOUND"
+        if (scanResult) {
+          const out = typeof scanResult === 'string' ? scanResult : JSON.stringify(scanResult);
+          secureLog('CLAMAV', 'ClamAV scan result', { host, port, out });
+          if (out && out.toUpperCase().includes('FOUND')) {
+            return {
+              safe: false,
+              detectedType,
+              details: `⛔ ClamAV detected a virus: ${out}`,
+              clamav: out
+            };
+          }
+        }
+      } catch (clamErr) {
+        // If ClamAV client isn't installed or scan fails, log and continue without blocking uploads
+        secureLog('CLAMAV', 'ClamAV scan skipped or failed', { error: clamErr?.message });
+      }
+    }
     
     // Rechazar archivos de tipo desconocido
     if (detectedType === 'UNKNOWN') {
@@ -366,6 +536,7 @@ export const detectSteganography = async (filePath) => {
     return {
       safe: !isSuspicious,
       detectedType,
+      detectedMime,
       entropy: entropy.toFixed(2),
       hiddenFiles: suspiciousFiles,
       trailingData,
