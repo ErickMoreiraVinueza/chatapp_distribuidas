@@ -10,7 +10,7 @@ const generateToken = (id) => {
 };
 
 // 🔹 Registro
-export const registerAdmin = async (req, res) => {
+ const registerAdmin = async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
