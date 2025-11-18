@@ -1,6 +1,7 @@
 // steganographyDetector.js - Detecta archivos con esteganografía
 import fs from 'fs';
 import { fileTypeFromBuffer } from 'file-type';
+import zlib from 'zlib';
 import { secureLog } from '../utils/logger.js';
 
 /**
@@ -368,6 +369,85 @@ const validateMKV = (buffer) => {
 };
 
 /**
+ * Extrae streams de imagen embebidos dentro de un PDF.
+ * Intenta detectar el filtro (/Filter) usado para cada stream (DCTDecode, FlateDecode, JPXDecode, etc.)
+ * @param {Buffer} buffer - Contenido del PDF
+ * @returns {Array<{data: Buffer, filter: string|null, objIndex: number}>}
+ */
+const extractImageStreamsFromPDF = (buffer) => {
+  const results = [];
+  // Usar latin1 para preservar bytes 1:1 en la conversión a string
+  const str = buffer.toString('latin1');
+  let idx = 0;
+
+  while (true) {
+    const imgPos = str.indexOf('/Subtype', idx);
+    if (imgPos === -1) break;
+
+    // Verificar que sea realmente una imagen (/Subtype /Image)
+    const sub = str.substr(imgPos, 40);
+    const isImage = /\/Subtype\s*\/Image/.test(sub);
+    if (!isImage) { idx = imgPos + 8; continue; }
+
+    // Buscar el token 'stream' después del descriptor del objeto
+    const streamPos = str.indexOf('stream', imgPos);
+    const endstreamPos = str.indexOf('endstream', streamPos);
+    if (streamPos === -1 || endstreamPos === -1) { idx = imgPos + 8; continue; }
+
+    // Buscar /Filter entre imgPos y streamPos
+    const headerSegment = str.substring(imgPos, streamPos);
+    let filter = null;
+    const filterMatch = headerSegment.match(/\/Filter\s*\/([A-Za-z0-9]+)/);
+    if (filterMatch) filter = filterMatch[1];
+    else {
+      // Buscar arrays de filtros: /Filter [ /FlateDecode /DCTDecode ]
+      const filtersArr = headerSegment.match(/\/Filter\s*\[([^\]]+)\]/);
+      if (filtersArr) {
+        const inside = filtersArr[1];
+        const m = inside.match(/\/([A-Za-z0-9]+)/);
+        if (m) filter = m[1];
+      }
+    }
+
+    // Calcular offsets en bytes: la conversión latin1 preserva 1:1, por lo que indices de string corresponden a bytes
+    const dataStart = streamPos + 6; // salto pasado el token 'stream'
+    // saltar posible CR/LF luego de 'stream'
+    let startByte = dataStart;
+    if (str[startByte] === '\r') startByte++;
+    if (str[startByte] === '\n') startByte++;
+
+    const dataEnd = endstreamPos;
+    // Mapea a offsets de buffer
+    const bufStart = startByte;
+    const bufEnd = dataEnd;
+    if (bufEnd <= bufStart || bufStart < 0) { idx = imgPos + 8; continue; }
+
+    let data = buffer.slice(bufStart, bufEnd);
+
+    // Si el filtro es FlateDecode, intentar descomprimir
+    if (filter === 'FlateDecode') {
+      try {
+        // Inflar (zlib) - algunos streams usan encabezado zlib
+        data = zlib.inflateSync(data);
+      } catch (e1) {
+        try {
+          // Intentar raw inflate
+          data = zlib.inflateRawSync(data);
+        } catch (e2) {
+          // Si falla, dejar los datos crudos (no podremos analizar más)
+        }
+      }
+    }
+
+    results.push({ data, filter, objIndex: imgPos });
+
+    idx = endstreamPos + 9; // avanzar después de 'endstream'
+  }
+
+  return results;
+};
+
+/**
  * Función principal de detección de esteganografía
  * @param {string} filePath - Ruta del archivo a analizar
  * @returns {Object} - Resultado del análisis
@@ -528,10 +608,37 @@ export const detectSteganography = async (filePath) => {
     const criticalFiles = suspiciousFiles.filter(f => f.risk === 'CRITICAL');
     const highRiskFiles = suspiciousFiles.filter(f => f.risk === 'HIGH');
 
+    // Si es PDF, extraer imágenes embebidas y analizarlas individualmente
+    let pdfImageAnalysis = [];
+    if (detectedType === 'PDF') {
+      try {
+        const images = extractImageStreamsFromPDF(buffer);
+        for (const img of images) {
+          const imgType = detectFileType(img.data);
+          const imgEntropy = calculateEntropy(img.data);
+          const imgHidden = scanForHiddenFiles(img.data);
+          const imgHighEntropy = imgEntropy > 8.0;
+
+          const imgSuspicious = imgHidden.some(h => h.risk === 'CRITICAL' || h.risk === 'HIGH') || imgHighEntropy;
+
+          pdfImageAnalysis.push({ filter: img.filter, type: imgType, entropy: imgEntropy.toFixed ? imgEntropy.toFixed(2) : imgEntropy, hiddenFiles: imgHidden, suspicious: imgSuspicious, objIndex: img.objIndex });
+
+          // Si encontramos algo sospechoso dentro de una imagen embebida, propagarlo a `suspiciousFiles`
+          if (imgSuspicious) {
+            suspiciousFiles.push(...imgHidden.map(h => ({ ...h, context: 'PDF_IMAGE' })));
+          }
+        }
+      } catch (e) {
+        // No detener el análisis si falla la extracción; sólo loguear
+        secureLog('PDF', 'Error al extraer imágenes del PDF', { error: e?.message });
+      }
+    }
+
     const isSuspicious = criticalFiles.length > 0 ||
                         highRiskFiles.length > 0 ||
                         (trailingData && trailingData.suspicious) ||
-                        (highEntropy && detectedType !== 'ZIP' && detectedType !== 'RAR');
+                        (highEntropy && detectedType !== 'ZIP' && detectedType !== 'RAR') ||
+                        (pdfImageAnalysis.length > 0 && pdfImageAnalysis.some(p => p.suspicious));
     
     return {
       safe: !isSuspicious,
@@ -539,6 +646,7 @@ export const detectSteganography = async (filePath) => {
       detectedMime,
       entropy: entropy.toFixed(2),
       hiddenFiles: suspiciousFiles,
+      pdfImageAnalysis,
       trailingData,
       highEntropy,
       fileSize: buffer.length,

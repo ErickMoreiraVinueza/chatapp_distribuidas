@@ -78,4 +78,27 @@ describe('detectSteganography - sample file detection', () => {
     expect(res.detectedType).toBe('PDF');
     expect(res.safe).toBe(true);
   });
+
+  test('detect PDF with embedded JPEG that contains hidden ZIP signature', async () => {
+    // JPEG minimal header/footer plus some data and then a ZIP signature embedded
+    const jpeg = Buffer.from([0xFF,0xD8,0xFF,0xE0,0x00,0x10,0x4A,0x46,0x49,0x46,0x00,0x01,0x11,0x22,0x33,0xFF,0xD9]);
+    const zipSig = Buffer.from([0x50,0x4B,0x03,0x04,0x14,0x00,0x00,0x00]);
+    const imgWithZip = Buffer.concat([jpeg, Buffer.from([0x00,0xAA,0xBB,0xCC]), zipSig, Buffer.from([0x01,0x02])]);
+
+    const header = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image /Filter /DCTDecode >>\nstream\n','latin1');
+    const footer = Buffer.from('\nendstream\nendobj\n','latin1');
+    const pdfBuf = Buffer.concat([header, imgWithZip, footer]);
+
+    const p = writeSample('sample_pdf_with_hidden.zip.pdf', pdfBuf);
+    files.push(p);
+
+    const res = await detectSteganography(p);
+    expect(res.detectedType).toBe('PDF');
+    // Debe detectar al menos una detección oculta (ZIP) dentro de la imagen embebida
+    const hidden = res.hiddenFiles || [];
+    const pdfImgs = res.pdfImageAnalysis || [];
+    const foundZip = hidden.some(h => h.type === 'ZIP') || pdfImgs.some(img => (img.hiddenFiles || []).some(h=>h.type==='ZIP'));
+    expect(foundZip).toBe(true);
+    expect(res.safe).toBe(false);
+  });
 });
